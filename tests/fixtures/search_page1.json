@@ -1,0 +1,31 @@
+{
+  "data": [
+    {
+      "id": "1001",
+      "text": "a carne bovina subiu de novo esse mes",
+      "username": "joao",
+      "permalink": "https://www.threads.com/@joao/post/AAA",
+      "timestamp": "2026-07-01T12:00:00+0000",
+      "media_type": "TEXT_POST",
+      "has_replies": true,
+      "is_reply": false,
+      "is_quote_post": false,
+      "campo_novo_da_meta": "preservado por extra=allow"
+    },
+    {
+      "id": "1002",
+      "text": "exportacao de carne batendo recorde",
+      "username": "maria",
+      "permalink": "https://www.threads.com/@maria/post/BBB",
+      "timestamp": "2026-07-02T08:30:00+0000",
+      "media_type": "IMAGE",
+      "has_replies": false
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "CURSOR_ANTES",
+      "after": "CURSOR_PAGINA2"
+    }
+  }
+}

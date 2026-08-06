@@ -1,0 +1,17 @@
+{
+  "data": [
+    {
+      "id": "1003",
+      "text": "preco do boi gordo estabilizou",
+      "username": "carlos",
+      "timestamp": "2026-07-03T09:15:00+0000",
+      "media_type": "TEXT_POST",
+      "has_replies": false
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "CURSOR_PAGINA2"
+    }
+  }
+}

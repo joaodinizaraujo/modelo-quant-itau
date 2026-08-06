@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "(#200) Requires threads_keyword_search permission",
+    "type": "OAuthException",
+    "code": 200,
+    "fbtrace_id": "AbCdEf123"
+  }
+}

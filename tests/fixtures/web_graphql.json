@@ -1,0 +1,46 @@
+{
+  "data": {
+    "xdt_api__v1__feed__user_timeline_graphql_connection": {
+      "edges": [
+        {
+          "node": {
+            "thread_items": [
+              {
+                "post": {
+                  "pk": "3001",
+                  "code": "CCC",
+                  "taken_at": 1782000000,
+                  "caption": { "text": "timeline completo via backend web" },
+                  "user": { "username": "joao", "pk": "9001" },
+                  "like_count": 42,
+                  "text_post_app_info": { "direct_reply_count": 3 }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "node": {
+            "thread_items": [
+              {
+                "post": {
+                  "pk": "3002",
+                  "code": "DDD",
+                  "taken_at": 1782100000,
+                  "caption": { "text": "segundo post do timeline" },
+                  "user": { "username": "joao", "pk": "9001" },
+                  "video_versions": [{ "url": "https://exemplo/v.mp4" }],
+                  "text_post_app_info": { "direct_reply_count": 0 }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "page_info": {
+        "has_next_page": false,
+        "end_cursor": null
+      }
+    }
+  }
+}
