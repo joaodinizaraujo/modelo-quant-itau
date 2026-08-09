@@ -407,6 +407,38 @@ tendencia_acao[sma_acao.isna()] = 0
 
 print(f'📈 Tendência individual calculada (SMA {JANELA_TENDENCIA_ACAO} dias) para {len(acoes_disponiveis)} ativos.')
 
+"""## 📰 Passo 8.5: Indicador de Notícia (novo na v4)
+
+Os três filtros anteriores (regime macro, tendência da ação, term structure) são todos
+derivados de **preço** — por construção só reagem depois que o mercado se mexeu. O indicador
+de notícia tenta ler a causa antes do efeito.
+
+A base vem de um CSV externo (`fonte, manchete, datahora, sinal`) com o sinal em [-1, 1] já
+atribuído; notícias irrelevantes ficam com o sinal vazio e são descartadas. O módulo
+`news_signal.py` faz o corte de sessão (16h de NY), agrega o dia e aplica o decaimento
+exponencial. A rubrica completa de classificação está documentada no topo daquele arquivo.
+
+Se o CSV ou o módulo não estiverem presentes (rodando no Colab sem subir os arquivos),
+o notebook **não quebra** — segue com `regime_noticia = 0` em todos os dias, exatamente como
+faz quando a chave da EIA está ausente.
+"""
+
+# =============================================================================
+# INDICADOR DE NOTÍCIA
+# =============================================================================
+
+ARQUIVO_NOTICIAS = 'noticias_exemplo.csv'
+NOTICIAS_DISPONIVEIS = False
+
+try:
+    import news_signal
+    regime_noticia = news_signal.carregar_regime(ARQUIVO_NOTICIAS, df.index)
+    NOTICIAS_DISPONIVEIS = True
+except Exception as e:
+    print(f'⚠️ Indicador de notícia desativado: {e}')
+    print('   O notebook vai continuar sem o 4º voto (regime_noticia ficará neutro).')
+    regime_noticia = pd.Series(0, index=df.index)
+
 """## 📏 Passo 9: Position Sizing por Volatilidade Realizada (igual à v2)"""
 
 JANELA_VOL = 21
@@ -419,11 +451,12 @@ escala_vol = escala_vol.fillna(1.0)
 
 print(f'📏 Escala de volatilidade calculada (alvo: {VOL_ALVO_ANUALIZADA:.0%} a.a., janela {JANELA_VOL}d).')
 
-"""## 📡 Passo 10: Geração de Sinais — v1, v2 e v3
+"""## 📡 Passo 10: Geração de Sinais — v1, v2, v3 e v4
 
 - **v1**: mean-reversion pura (baseline original)
 - **v2**: v1 + filtro de regime macro + tendência da ação + vol scaling + stop-loss
 - **v3**: v2 + term structure como 3º voto no score de convicção + **hold override com trailing stop** (deixa a posição correr quando a convicção estrutural continua forte, em vez de sair no primeiro sinal de reversão)
+- **v4**: v3 + **indicador de notícia** como 4º voto (score passa a variar de -4 a +4)
 
 O **score de convicção** em v3 é a soma dos 3 filtros (`regime_macro + tendencia_acao + regime_term`), variando de -3 a +3:
 - `score ≤ -2`: pelo menos 2 dos 3 sinais concordam em baixa estrutural → só aí um short é permitido, e um long ignora o override
@@ -440,6 +473,19 @@ LIMIAR_ENTRADA = 1.5
 LIMIAR_SAIDA = 0.5
 STOP_LOSS_PCT = 0.12
 TRAILING_STOP_PCT = 0.08   # novo em v3: protege lucro quando o hold override está ativo
+
+# Convicção mínima para confirmar um regime. Na v3 são 3 votos (-3..+3) e o corte é 2.
+# Na v4 são 4 votos (-4..+4): manter 2 afrouxa o critério (passa a bastar 2 de 4).
+#
+# Rodamos as duas calibrações no CSV de exemplo (Sharpe out-of-sample, v3 = -0.67):
+#   LIMIAR_SCORE_V4 = 2  ->  -0.69   (322 posições ticker-dia divergindo da v3)
+#   LIMIAR_SCORE_V4 = 3  ->  -0.60   (1963 divergências)
+# Mas o controle com 3 e SEM notícia nenhuma dá -0.64 com 1738 divergências: ou seja, a
+# maior parte do ganho do corte 3 vem do próprio aperto do critério, não da notícia.
+# Mantemos 2 como padrão porque é o único valor em que "sem CSV de notícia" reproduz a v3
+# exatamente — o que torna o efeito da notícia isolável. Trocar para 3 é uma decisão de
+# calibração separada, que merece grid search só no período de treino.
+LIMIAR_SCORE_V4 = 2
 
 zscores = pd.DataFrame(index=df.index, columns=acoes_disponiveis, dtype=float)
 for ticker in acoes_disponiveis:
@@ -632,6 +678,91 @@ print('\n🔁 Dias em que o "hold override" segurou a posição em vez de sair p
 for t in acoes_disponiveis:
     print(f'  {t}: longs seguradas em {overrides_long[t]}d | shorts seguradas em {overrides_short[t]}d')
 
+# =============================================================================
+# SINAL v4: v3 + INDICADOR DE NOTÍCIA COMO 4º VOTO
+# =============================================================================
+# Cópia do loop da v3 com uma única mudança de lógica: o score de convicção passa a somar
+# `reg_noticia` e vai de -4 a +4. Com o CSV de notícias ausente, `regime_noticia` é 0 em
+# todos os dias e a v4 fica numericamente idêntica à v3 (com LIMIAR_SCORE_V4 = 2).
+
+posicoes_brutas_v4 = pd.DataFrame(index=df.index, columns=acoes_disponiveis, dtype=float)
+posicoes_ajustadas_v4 = pd.DataFrame(index=df.index, columns=acoes_disponiveis, dtype=float)
+
+for ticker in acoes_disponiveis:
+    seg = TICKER_PARA_SEGMENTO.get(ticker, 'Upstream')
+    mult_risco = ATIVOS_POR_SEGMENTO[seg]['multiplicador_risco']
+    zscore = zscores[ticker]
+    tend_acao = tendencia_acao[ticker]
+    preco_ticker = precos_nivel[ticker]
+
+    posicao = pd.Series(0.0, index=df.index)
+    posicao_atual = 0
+    preco_entrada = np.nan
+    preco_pico = np.nan
+
+    for i in range(len(df)):
+        z = zscore.iloc[i]
+        reg_macro = regime_macro.iloc[i]
+        reg_acao = tend_acao.iloc[i]
+        reg_termo = regime_term.iloc[i]
+        reg_noticia = regime_noticia.iloc[i]
+        preco_hoje = preco_ticker.iloc[i]
+
+        if pd.isna(z):
+            posicao.iloc[i] = 0
+            continue
+
+        # score de convicção: -4 (bearish total) a +4 (bullish total)
+        score = reg_macro + reg_acao + reg_termo + reg_noticia
+        baixa_confirmada = score <= -LIMIAR_SCORE_V4
+        alta_confirmada = score >= LIMIAR_SCORE_V4
+
+        if posicao_atual == 0:
+            if z < -LIMIAR_ENTRADA and not baixa_confirmada:
+                posicao_atual = 1
+                preco_entrada = preco_hoje
+                preco_pico = preco_hoje
+            elif z > LIMIAR_ENTRADA and baixa_confirmada:
+                posicao_atual = -1
+                preco_entrada = preco_hoje
+                preco_pico = preco_hoje
+
+        elif posicao_atual == 1:
+            preco_pico = preco_hoje if np.isnan(preco_pico) else max(preco_pico, preco_hoje)
+            perda_entrada = (preco_hoje / preco_entrada) - 1
+            queda_do_topo = 1 - (preco_hoje / preco_pico)
+
+            sinal_reversao_neutro = z > -LIMIAR_SAIDA
+            sai_por_reversao = sinal_reversao_neutro and not alta_confirmada
+
+            if sai_por_reversao or perda_entrada < -STOP_LOSS_PCT or queda_do_topo > TRAILING_STOP_PCT:
+                posicao_atual = 0
+                preco_entrada = np.nan
+                preco_pico = np.nan
+
+        elif posicao_atual == -1:
+            preco_pico = preco_hoje if np.isnan(preco_pico) else min(preco_pico, preco_hoje)
+            perda_entrada = 1 - (preco_hoje / preco_entrada)
+            retracao_do_fundo = (preco_hoje / preco_pico) - 1
+
+            sinal_reversao_neutro = z < LIMIAR_SAIDA
+            sai_por_reversao = sinal_reversao_neutro and not baixa_confirmada
+
+            if sai_por_reversao or perda_entrada < -STOP_LOSS_PCT or retracao_do_fundo > TRAILING_STOP_PCT:
+                posicao_atual = 0
+                preco_entrada = np.nan
+                preco_pico = np.nan
+
+        posicao.iloc[i] = posicao_atual
+
+    posicoes_brutas_v4[ticker] = posicao
+    escala = escala_vol[ticker]
+    posicoes_ajustadas_v4[ticker] = posicao * mult_risco * escala
+
+dias_divergentes = (posicoes_brutas_v4 != posicoes_brutas_v3).sum().sum()
+print(f'\n📡 Sinal v4 gerado (LIMIAR_SCORE_V4 = {LIMIAR_SCORE_V4}).')
+print(f'   Posições ticker-dia em que a v4 divergiu da v3: {dias_divergentes}')
+
 """## 🔬 Passo 11: Backtest Comparativo — v1 vs v2 vs v3 vs Buy & Hold
 
 Mesmas regras de rigor: execução defasada (`shift(1)`), custo de transação, separação treino/teste 60/40. Todos os filtros (regime macro, tendência da ação, term structure) usam apenas dado disponível até o dia anterior — sem look-ahead bias em nenhuma camada.
@@ -662,11 +793,13 @@ def calcula_retorno_portfolio(posicoes_ajustadas):
 retorno_portfolio_v1 = calcula_retorno_portfolio(posicoes_ajustadas_v1)
 retorno_portfolio_v2 = calcula_retorno_portfolio(posicoes_ajustadas_v2)
 retorno_portfolio_v3 = calcula_retorno_portfolio(posicoes_ajustadas_v3)
+retorno_portfolio_v4 = calcula_retorno_portfolio(posicoes_ajustadas_v4)
 retorno_bh = df[acoes_disponiveis].mean(axis=1)
 
 ret_v1_test = retorno_portfolio_v1.loc[idx_teste]
 ret_v2_test = retorno_portfolio_v2.loc[idx_teste]
 ret_v3_test = retorno_portfolio_v3.loc[idx_teste]
+ret_v4_test = retorno_portfolio_v4.loc[idx_teste]
 ret_bh_test = retorno_bh.loc[idx_teste]
 
 def calcular_metricas(retornos, rf_diaria=0.0):
@@ -694,15 +827,17 @@ def calcular_metricas(retornos, rf_diaria=0.0):
 m_v1 = calcular_metricas(ret_v1_test)
 m_v2 = calcular_metricas(ret_v2_test)
 m_v3 = calcular_metricas(ret_v3_test)
+m_v4 = calcular_metricas(ret_v4_test)
 m_bh = calcular_metricas(ret_bh_test)
 
 print('\n📊 RESULTADOS DO BACKTEST (período de teste out-of-sample):')
-print('=' * 96)
-print(f'{"Métrica":<22} {"v1 (baseline)":>16} {"v2 (híbrido)":>16} {"v3 (+ term struct)":>20} {"Buy & Hold":>16}')
-print('-' * 96)
+print('=' * 114)
+print(f'{"Métrica":<22} {"v1 (baseline)":>16} {"v2 (híbrido)":>16} {"v3 (+ term struct)":>20} '
+      f'{"v4 (+ notícia)":>18} {"Buy & Hold":>16}')
+print('-' * 114)
 for k in m_v1:
-    print(f'{k:<22} {m_v1[k]:>16} {m_v2[k]:>16} {m_v3[k]:>20} {m_bh[k]:>16}')
-print('=' * 96)
+    print(f'{k:<22} {m_v1[k]:>16} {m_v2[k]:>16} {m_v3[k]:>20} {m_v4[k]:>18} {m_bh[k]:>16}')
+print('=' * 114)
 print('\n⚠️  Lembrete: Resultados passados não garantem resultados futuros!')
 
 """## 📊 Passo 12: Visualização do Backtest"""
@@ -717,9 +852,11 @@ ax1 = axes[0]
 acum_v1 = (1 + ret_v1_test).cumprod()
 acum_v2 = (1 + ret_v2_test).cumprod()
 acum_v3 = (1 + ret_v3_test).cumprod()
+acum_v4 = (1 + ret_v4_test).cumprod()
 acum_bh = (1 + ret_bh_test).cumprod()
 
-ax1.plot(acum_v3, label='v3 (+ term structure + hold override)', color='#e67e22', linewidth=2.2)
+ax1.plot(acum_v4, label='v4 (+ indicador de notícia)', color='#c0392b', linewidth=2.2)
+ax1.plot(acum_v3, label='v3 (+ term structure + hold override)', color='#e67e22', linewidth=1.8, linestyle='--')
 ax1.plot(acum_v2, label='v2 (regime + tendência + vol)', color='#2ecc71', linewidth=1.6, linestyle='--')
 ax1.plot(acum_v1, label='v1 (mean-reversion baseline)', color='#9b59b6', linewidth=1.3, linestyle=':')
 ax1.plot(acum_bh, label='Buy & Hold Ações', color='#3498db', linewidth=1.6, linestyle='-.')
@@ -732,9 +869,11 @@ ax2 = axes[1]
 pico_v1 = acum_v1.cummax(); dd_v1 = (acum_v1 - pico_v1) / pico_v1
 pico_v2 = acum_v2.cummax(); dd_v2 = (acum_v2 - pico_v2) / pico_v2
 pico_v3 = acum_v3.cummax(); dd_v3 = (acum_v3 - pico_v3) / pico_v3
+pico_v4 = acum_v4.cummax(); dd_v4 = (acum_v4 - pico_v4) / pico_v4
 pico_bh = acum_bh.cummax(); dd_bh = (acum_bh - pico_bh) / pico_bh
 
-ax2.fill_between(dd_v3.index, dd_v3, 0, alpha=0.45, color='#e67e22', label='v3')
+ax2.fill_between(dd_v4.index, dd_v4, 0, alpha=0.45, color='#c0392b', label='v4')
+ax2.fill_between(dd_v3.index, dd_v3, 0, alpha=0.35, color='#e67e22', label='v3')
 ax2.fill_between(dd_v2.index, dd_v2, 0, alpha=0.25, color='#2ecc71', label='v2')
 ax2.fill_between(dd_v1.index, dd_v1, 0, alpha=0.15, color='#9b59b6', label='v1')
 ax2.fill_between(dd_bh.index, dd_bh, 0, alpha=0.15, color='#3498db', label='Buy & Hold')
@@ -747,7 +886,25 @@ ax2.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
 
-"""## 📋 Conclusões e Limitações do Modelo v3
+"""## 📰 Sobre a v4 (indicador de notícia)
+
+A v4 é a v3 com um 4º voto no score de convicção, vindo de um CSV externo de notícias já
+pontuadas em [-1, 1]. **O CSV que acompanha o repo (`noticias_exemplo.csv`) é sintético e
+serve só para exercitar o encanamento** — as manchetes são ilustrativas (fonte `EXEMPLO`),
+cobrem apenas 2024-2025 e portanto ~5% do período de teste. Qualquer diferença de métrica
+entre v3 e v4 hoje é ruído, não evidência: o que está validado é o caminho do dado, não o
+sinal.
+
+O que já está garantido por construção:
+- **Sem look-ahead**: notícia publicada após as 16h de NY só conta para o pregão seguinte, e
+  o backtest ainda aplica `shift(1)` por cima.
+- **Degradação limpa**: sem o CSV, a v4 reproduz a v3 número a número (0 divergências) —
+  é o teste que prova que o wiring não mexeu em mais nada.
+
+Para virar sinal de verdade falta a base real de notícias e o classificador automático
+(a rubrica que ele vai seguir já está escrita no topo de `news_signal.py`).
+
+## 📋 Conclusões e Limitações do Modelo v3
 
 ### ✅ O que a v3 adiciona sobre a v2:
 - Um terceiro sinal independente (term structure) que captura expectativa de oferta/demanda de curto prazo — informação que nem o preço nem o beta ao WTI capturam diretamente
