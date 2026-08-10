@@ -159,6 +159,11 @@ REGRAS INEGOCIÁVEIS:
 MODELO_PADRAO = 'gemini-3.5-flash-lite'
 TAMANHO_LOTE = 20
 TENTATIVAS = 3
+SALVAR_A_CADA = 20   # a cada N lotes o CSV parcial é gravado, para sobreviver a um kill
+
+# Estados de execução interrompida, não veredito da LLM: ficam com sinal vazio no
+# CSV, mas são reprocessados na próxima execução (o cache os ignora).
+MOTIVOS_PROVISORIOS = ['nao_classificado', 'sem_resposta']
 
 CANAIS = ['OFERTA', 'DEMANDA', 'ESTOQUES', 'GEOPOLITICA', 'REGULATORIO',
           'SETORIAL', 'NENHUM']
@@ -289,7 +294,13 @@ def classificar_csv(entrada, saida, modelo=MODELO_PADRAO, tamanho_lote=TAMANHO_L
     faltando = [c for c in COLUNAS_ENTRADA if c not in brutas.columns]
     if faltando:
         raise ValueError(f'CSV de entrada sem as colunas obrigatórias: {faltando}')
-    brutas = brutas.reset_index(drop=True)
+
+    # Ordem cronológica: se a execução parar no meio (cota, rede, Ctrl-C), o que
+    # ficou pronto é um bloco contínuo de datas e o que falta é a cauda — em vez
+    # de buracos espalhados pela série inteira.
+    brutas = brutas.assign(_quando=_parse_datahora(_combinar_data_hora(brutas)))
+    brutas = (brutas.sort_values('_quando', kind='stable')
+                    .drop(columns='_quando').reset_index(drop=True))
 
     relevantes, canais_filtro = filtrar(brutas['manchete'])
     if verbose:
@@ -302,34 +313,60 @@ def classificar_csv(entrada, saida, modelo=MODELO_PADRAO, tamanho_lote=TAMANHO_L
     if verbose:
         print(f'\n📰 {len(cache)} reaproveitadas do cache | {len(pendentes)} a classificar')
 
-    resultados = {}
+    resultados, processados, interrompido = {}, set(), None
     if pendentes:
         cliente = _criar_cliente()
-        for inicio in range(0, len(pendentes), tamanho_lote):
-            bloco = pendentes[inicio:inicio + tamanho_lote]
-            obtidos = _classificar_lote(cliente, brutas, bloco, modelo)
+        total_lotes = -(-len(pendentes) // tamanho_lote)
 
-            # Ids que não voltaram no lote: reprocessa um a um antes de desistir.
-            for i in [i for i in bloco if int(i) not in obtidos]:
-                obtidos.update(_classificar_lote(cliente, brutas, [i], modelo))
+        for numero, inicio in enumerate(range(0, len(pendentes), tamanho_lote), start=1):
+            bloco = pendentes[inicio:inicio + tamanho_lote]
+            try:
+                obtidos = _classificar_lote(cliente, brutas, bloco, modelo)
+
+                # Ids que não voltaram no lote: reprocessa um a um antes de desistir.
+                for i in [i for i in bloco if int(i) not in obtidos]:
+                    obtidos.update(_classificar_lote(cliente, brutas, [i], modelo))
+            except (Exception, KeyboardInterrupt) as erro:
+                # Nada de perder o que já foi pago: sai do laço e grava o parcial.
+                interrompido = erro
+                break
 
             resultados.update(obtidos)
+            processados.update(int(i) for i in bloco)
             if verbose:
-                print(f'   lote {inicio // tamanho_lote + 1}: '
-                      f'{len(obtidos)}/{len(bloco)} classificadas')
+                print(f'   lote {numero}/{total_lotes}: {len(obtidos)}/{len(bloco)} classificadas')
 
-    linhas = [_montar_linha(brutas.loc[i], cache, resultados, modelo,
+            if numero % SALVAR_A_CADA == 0:
+                _gravar(brutas, cache, resultados, processados, modelo,
+                        relevantes, canais_filtro, saida)
+                if verbose:
+                    print(f'   💾 progresso salvo em {saida}')
+
+    pontuadas = _gravar(brutas, cache, resultados, processados, modelo,
+                        relevantes, canais_filtro, saida)
+
+    if verbose:
+        _resumir(pontuadas, saida)
+    if interrompido is not None:
+        pendente = int(pontuadas['motivo_descarte'].eq('nao_classificado').sum())
+        print(f'\n⚠️ INTERROMPIDO: {type(interrompido).__name__}: {interrompido}')
+        print(f'   {pendente} manchetes ficaram como nao_classificado (sinal vazio).')
+        print(f'   O que já foi classificado está salvo em {saida}. Para retomar de onde '
+              f'parou, rode o mesmo comando de novo — o cache pula o que já está pronto.')
+    return pontuadas
+
+
+def _gravar(brutas, cache, resultados, processados, modelo, relevantes, canais_filtro, saida):
+    """Monta o CSV completo com o que existe até agora e grava."""
+    linhas = [_montar_linha(brutas.loc[i], cache, resultados, processados, modelo,
                             bool(relevantes.iloc[i]), canais_filtro.iloc[i])
               for i in brutas.index]
     pontuadas = pd.DataFrame(linhas, columns=COLUNAS + COLUNAS_AUDITORIA)
     pontuadas.to_csv(saida, index=False)
-
-    if verbose:
-        _resumir(pontuadas, saida)
     return pontuadas
 
 
-def _montar_linha(bruta, cache, resultados, modelo, relevante, canais):
+def _montar_linha(bruta, cache, resultados, processados, modelo, relevante, canais):
     em_cache = cache.get(_chave(bruta))
     if em_cache is not None:
         return em_cache
@@ -340,10 +377,15 @@ def _montar_linha(bruta, cache, resultados, modelo, relevante, canais):
         sinal, motivo, resultado = None, 'filtro_local', {}
     else:
         resultado = resultados.get(int(bruta.name))
-        if resultado is None:
+        if resultado is not None:
+            sinal, motivo = _resultado_para_sinal(resultado, bruta['manchete'])
+        elif int(bruta.name) in processados:
+            # Foi enviada e a LLM não devolveu nada para ela.
             sinal, motivo, resultado = None, 'sem_resposta', {}
         else:
-            sinal, motivo = _resultado_para_sinal(resultado, bruta['manchete'])
+            # Nem chegou a ser enviada (execução interrompida). Provisório: a
+            # próxima execução tenta de novo, porque o cache ignora este motivo.
+            sinal, motivo, resultado = None, 'nao_classificado', {}
 
     return {
         'jornal': bruta['jornal'],
@@ -425,8 +467,13 @@ def _ler_cache(saida, modelo):
     anterior = pd.read_csv(saida, encoding='utf-8-sig')
     if 'versao_rubrica' not in anterior.columns:
         return {}
+
+    # `nao_classificado` e `sem_resposta` são estados provisórios de uma execução
+    # interrompida, não veredito. Se entrassem no cache, ficariam congelados como
+    # nulos para sempre e a retomada não retomaria nada.
     valido = anterior[(anterior['modelo'] == modelo)
-                      & (anterior['versao_rubrica'].astype(str) == VERSAO_RUBRICA)]
+                      & (anterior['versao_rubrica'].astype(str) == VERSAO_RUBRICA)
+                      & (~anterior['motivo_descarte'].isin(MOTIVOS_PROVISORIOS))]
     return {_chave(linha): linha.to_dict() for _, linha in valido.iterrows()}
 
 
