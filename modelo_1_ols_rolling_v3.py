@@ -418,6 +418,13 @@ atribuído; notícias irrelevantes ficam com o sinal vazio e são descartadas. O
 `news_signal.py` faz o corte de sessão (16h de NY), agrega o dia e aplica o decaimento
 exponencial. A rubrica completa de classificação está documentada no topo daquele arquivo.
 
+**O voto é relativo, não absoluto.** A pergunta não é "a notícia está altista?" — o
+noticiário de petróleo é estruturalmente altista (guerra e sanção empurram o preço para
+cima), e no nível absoluto esse voto ficava `+1` em 82% dos dias, virando uma constante
+somada ao score em vez de informação. O voto compara o noticiário de hoje com a média móvel
+dele mesmo (60 pregões), do mesmo jeito que o z-score do resíduo faz com a OLS: `+1` só
+quando está **mais** altista que o próprio normal.
+
 Se o CSV ou o módulo não estiverem presentes (rodando no Colab sem subir os arquivos),
 o notebook **não quebra** — segue com `regime_noticia = 0` em todos os dias, exatamente como
 faz quando a chave da EIA está ausente.
@@ -830,14 +837,39 @@ m_v3 = calcular_metricas(ret_v3_test)
 m_v4 = calcular_metricas(ret_v4_test)
 m_bh = calcular_metricas(ret_bh_test)
 
-print('\n📊 RESULTADOS DO BACKTEST (período de teste out-of-sample):')
-print('=' * 114)
-print(f'{"Métrica":<22} {"v1 (baseline)":>16} {"v2 (híbrido)":>16} {"v3 (+ term struct)":>20} '
-      f'{"v4 (+ notícia)":>18} {"Buy & Hold":>16}')
-print('-' * 114)
-for k in m_v1:
-    print(f'{k:<22} {m_v1[k]:>16} {m_v2[k]:>16} {m_v3[k]:>20} {m_v4[k]:>18} {m_bh[k]:>16}')
-print('=' * 114)
+def imprime_tabela(titulo, metricas):
+    m1, m2, m3, m4, mbh = metricas
+    print(titulo)
+    print('=' * 114)
+    print(f'{"Métrica":<22} {"v1 (baseline)":>16} {"v2 (híbrido)":>16} {"v3 (+ term struct)":>20} '
+          f'{"v4 (+ notícia)":>18} {"Buy & Hold":>16}')
+    print('-' * 114)
+    for k in m1:
+        print(f'{k:<22} {m1[k]:>16} {m2[k]:>16} {m3[k]:>20} {m4[k]:>18} {mbh[k]:>16}')
+    print('=' * 114)
+
+imprime_tabela('\n📊 RESULTADOS DO BACKTEST (período de teste out-of-sample):',
+               (m_v1, m_v2, m_v3, m_v4, m_bh))
+
+# Segunda tabela, só onde existe notícia. Sem ela a comparação v3 vs v4 é diluída:
+# antes da primeira manchete o voto de notícia é 0 e a v4 é idêntica à v3 por
+# construção. O corte sai da própria série (não de uma data no código), então
+# continua correto se a base de notícias mudar.
+dias_com_noticia = regime_noticia[regime_noticia != 0].index
+idx_noticia = idx_teste[idx_teste >= dias_com_noticia[0]] if len(dias_com_noticia) else []
+
+if len(idx_noticia) > 60:
+    metricas_noticia = tuple(calcular_metricas(r.loc[idx_noticia]) for r in
+                             (retorno_portfolio_v1, retorno_portfolio_v2, retorno_portfolio_v3,
+                              retorno_portfolio_v4, retorno_bh))
+    imprime_tabela(f'\n📰 MESMO BACKTEST, SÓ NO PERÍODO COM NOTÍCIA '
+                   f'({idx_noticia[0].date()} → {idx_noticia[-1].date()}, '
+                   f'{len(idx_noticia)} pregões):', metricas_noticia)
+    print('   É aqui que a v4 difere da v3 de fato — na tabela acima ela é idêntica')
+    print(f'   à v3 em {len(idx_teste) - len(idx_noticia)} dos {len(idx_teste)} pregões de teste.')
+else:
+    print('\nℹ️ Período com notícia curto demais para uma segunda tabela.')
+
 print('\n⚠️  Lembrete: Resultados passados não garantem resultados futuros!')
 
 """## 📊 Passo 12: Visualização do Backtest"""
