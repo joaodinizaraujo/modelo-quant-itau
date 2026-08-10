@@ -413,7 +413,7 @@ Os três filtros anteriores (regime macro, tendência da ação, term structure)
 derivados de **preço** — por construção só reagem depois que o mercado se mexeu. O indicador
 de notícia tenta ler a causa antes do efeito.
 
-A base vem de um CSV externo (`fonte, manchete, datahora, sinal`) com o sinal em [-1, 1] já
+A base vem de um CSV externo (`jornal, manchete, data, hora, sinal`) com o sinal em [-1, 1] já
 atribuído; notícias irrelevantes ficam com o sinal vazio e são descartadas. O módulo
 `news_signal.py` faz o corte de sessão (16h de NY), agrega o dia e aplica o decaimento
 exponencial. A rubrica completa de classificação está documentada no topo daquele arquivo.
@@ -427,7 +427,7 @@ faz quando a chave da EIA está ausente.
 # INDICADOR DE NOTÍCIA
 # =============================================================================
 
-ARQUIVO_NOTICIAS = 'noticias_exemplo.csv'
+ARQUIVO_NOTICIAS = 'noticias_pontuadas.csv'
 NOTICIAS_DISPONIVEIS = False
 
 try:

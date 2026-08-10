@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "google-genai>=2.17.0",
     "matplotlib>=3.11.1",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
     "pandas-stubs>=3.0.5.260730",
+    "python-dotenv>=1.2.2",
     "requests>=2.34.2",
     "scipy>=1.18.0",
     "scipy-stubs>=1.18.0.1",
