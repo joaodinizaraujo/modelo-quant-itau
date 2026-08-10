@@ -255,8 +255,16 @@ COLUNAS = COLUNAS_ENTRADA + ['sinal']
 FUSO_PREGAO = 'America/New_York'
 HORA_CORTE = 16          # fechamento do pregão em NY
 MEIA_VIDA_DIAS = 3       # em quantos dias o impacto de uma manchete cai pela metade
-LIMIAR_NOTICIA = 0.15    # zona morta do voto, no mesmo espírito do LIMIAR_TERMO
 PASSO_SINAL = 0.1        # o sinal é discreto: só múltiplos de 0,1
+
+# O voto é RELATIVO, não absoluto: compara o noticiário de hoje com a média dele
+# mesmo nos últimos ~3 meses. No nível absoluto o voto ficava +1 em 82% dos dias
+# (o noticiário é estruturalmente altista: guerra e sanção empurram petróleo para
+# cima), o que é uma constante somada ao score, não informação. Normalizado, fica
+# ~19% / ~18% / ~62% — simétrico, como os outros três votantes.
+JANELA_NORMALIZACAO = 60   # ~3 meses de pregão
+LIMIAR_NOTICIA = 1.0       # em desvios-padrão do próprio noticiário
+MIN_OBS_NORMALIZACAO = 20  # antes disso não há base de comparação -> voto neutro
 
 
 def filtrar(manchetes):
@@ -722,11 +730,26 @@ def serie_diaria(noticias, calendario, meia_vida=MEIA_VIDA_DIAS, hora_corte=HORA
     return acumulado
 
 
-def regime_noticia(serie, limiar=LIMIAR_NOTICIA):
-    """Converte o score contínuo no voto discreto -1 / 0 / +1."""
+def regime_noticia(serie, janela=JANELA_NORMALIZACAO, limiar=LIMIAR_NOTICIA):
+    """Converte o score contínuo no voto discreto -1 / 0 / +1.
+
+    A pergunta NÃO é "a notícia está altista?" — a resposta seria sim quase todo
+    dia — e sim "está mais altista que o normal dela?". Mesmo mecanismo que o
+    modelo já usa no resíduo da OLS.
+
+    Só olha para trás (`rolling`), então não há look-ahead; o backtest ainda
+    aplica shift(1) por cima.
+    """
+    media = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).mean()
+    desvio = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).std()
+    z = (serie - media) / (desvio + 1e-10)
+
     regime = pd.Series(0, index=serie.index)
-    regime[serie > limiar] = 1
-    regime[serie < -limiar] = -1
+    regime[z > limiar] = 1
+    regime[z < -limiar] = -1
+    # z é NaN nos primeiros dias (sem base de comparação). As comparações acima já
+    # devolvem False para NaN, então esses dias ficam em 0 — nunca NaN, que
+    # contaminaria o score de convicção e faria os testes >= 2 falharem calados.
     return regime
 
 
