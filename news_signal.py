@@ -260,8 +260,11 @@ PASSO_SINAL = 0.1        # o sinal é discreto: só múltiplos de 0,1
 # O voto é RELATIVO, não absoluto: compara o noticiário de hoje com a média dele
 # mesmo nos últimos ~3 meses. No nível absoluto o voto ficava +1 em 82% dos dias
 # (o noticiário é estruturalmente altista: guerra e sanção empurram petróleo para
-# cima), o que é uma constante somada ao score, não informação. Normalizado, fica
-# ~19% / ~18% / ~62% — simétrico, como os outros três votantes.
+# cima), o que é uma constante somada ao score, não informação.
+#
+# Normalizado, o voto fica simétrico como os outros três votantes: na base atual
+# são 165 dias em +1 contra 131 em -1, equilibrados ano a ano. Essa simetria
+# depende de o estoque em `serie_diaria` NÃO ser clipado — ver o comentário lá.
 JANELA_NORMALIZACAO = 60   # ~3 meses de pregão
 LIMIAR_NOTICIA = 1.0       # em desvios-padrão do próprio noticiário
 MIN_OBS_NORMALIZACAO = 20  # antes disso não há base de comparação -> voto neutro
@@ -690,6 +693,19 @@ def _parse_datahora(coluna):
                      'Padronize a base (de preferência com offset explícito).')
 
 
+def _dia_efetivo(noticias, calendario, hora_corte=HORA_CORTE):
+    """Mapeia cada notícia para o pregão em que ela conta.
+
+    Notícia publicada até `hora_corte` conta para o próprio dia; depois disso, para
+    o pregão seguinte. Devolve (horário local, posição no calendário) — a posição
+    pode ser == len(calendario) para notícia além do fim da série.
+    """
+    local = noticias['datahora'].dt.tz_convert(FUSO_PREGAO).dt.tz_localize(None)
+    passou_do_corte = (local.dt.hour >= hora_corte).astype(int)
+    data_alvo = local.dt.normalize() + pd.to_timedelta(passou_do_corte, unit='D')
+    return local, calendario.searchsorted(data_alvo)
+
+
 def serie_diaria(noticias, calendario, meia_vida=MEIA_VIDA_DIAS, hora_corte=HORA_CORTE):
     """Agrega as notícias no calendário do modelo e aplica o decaimento.
 
@@ -703,16 +719,19 @@ def serie_diaria(noticias, calendario, meia_vida=MEIA_VIDA_DIAS, hora_corte=HORA
       graça, porque a data-alvo é mapeada para o primeiro dia do calendário >= ela.
     - Agregação do dia por SOMA CLIPADA em [-1, 1]: manchetes concordantes
       acumulam até saturar (a média achataria cinco manchetes na mesma direção).
+      O clip é do DIA, não do estoque — ele protege contra a densidade da base,
+      que cresceu de 1,4 manchete/dia em 2018 para 3,4 em 2026: sem ele, um dia
+      de cobertura pesada viraria sinal só por ter mais manchetes.
+
+    O estoque em si é deixado solto. Ele já é naturalmente limitado pela soma
+    geométrica do decaimento — com meia-vida de 3 dias, `1/(1 - 0.5**(1/3))` ≈
+    4,85 — e é o z-score de `regime_noticia` que traz tudo para a mesma régua.
     """
     calendario = pd.DatetimeIndex(calendario)
     diario = pd.Series(0.0, index=calendario)
 
     if len(noticias) > 0:
-        local = noticias['datahora'].dt.tz_convert(FUSO_PREGAO).dt.tz_localize(None)
-        passou_do_corte = (local.dt.hour >= hora_corte).astype(int)
-        data_alvo = local.dt.normalize() + pd.to_timedelta(passou_do_corte, unit='D')
-
-        pos = calendario.searchsorted(data_alvo)
+        _, pos = _dia_efetivo(noticias, calendario, hora_corte)
         dentro = pos < len(calendario)  # notícias além do fim do calendário caem fora
 
         por_dia = noticias.loc[dentro, 'sinal'].groupby(calendario[pos[dentro]]).sum()
@@ -721,13 +740,24 @@ def serie_diaria(noticias, calendario, meia_vida=MEIA_VIDA_DIAS, hora_corte=HORA
     # Estoque de notícia: entra cheio no dia e decai com meia-vida de `meia_vida`
     # dias. Loop explícito em vez de ewm() porque ewm normaliza e amorteceria o
     # impacto do próprio dia da manchete.
+    #
+    # NÃO clipar o estoque aqui. Clipar em ±1 saturava a série no teto (59% dos
+    # pregões de 2026) e, com a série grudada no máximo, ela não tem como ficar
+    # "mais altista que o próprio normal": o z do ano inteiro não passava de
+    # +0,93 e o voto +1 nunca disparava, enquanto o lado baixista seguia livre.
     fator = 0.5 ** (1 / meia_vida)
     acumulado = diario.copy()
     for i in range(1, len(acumulado)):
-        acumulado.iloc[i] = np.clip(
-            acumulado.iloc[i] + acumulado.iloc[i - 1] * fator, -1.0, 1.0)
+        acumulado.iloc[i] += acumulado.iloc[i - 1] * fator
 
     return acumulado
+
+
+def _zscore_noticia(serie, janela=JANELA_NORMALIZACAO):
+    """Normaliza o score contínuo pela própria média móvel — a régua do voto."""
+    media = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).mean()
+    desvio = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).std()
+    return (serie - media) / (desvio + 1e-10)
 
 
 def regime_noticia(serie, janela=JANELA_NORMALIZACAO, limiar=LIMIAR_NOTICIA):
@@ -740,9 +770,7 @@ def regime_noticia(serie, janela=JANELA_NORMALIZACAO, limiar=LIMIAR_NOTICIA):
     Só olha para trás (`rolling`), então não há look-ahead; o backtest ainda
     aplica shift(1) por cima.
     """
-    media = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).mean()
-    desvio = serie.rolling(janela, min_periods=MIN_OBS_NORMALIZACAO).std()
-    z = (serie - media) / (desvio + 1e-10)
+    z = _zscore_noticia(serie, janela)
 
     regime = pd.Series(0, index=serie.index)
     regime[z > limiar] = 1
@@ -767,7 +795,76 @@ def carregar_regime(caminho, calendario, meia_vida=MEIA_VIDA_DIAS,
     return regime
 
 
-def _autoteste(caminho='noticias_pontuadas.csv'):
+VERDE, VERMELHO, LARANJA = '#2ecc71', '#c0392b', '#e67e22'
+
+
+def plotar_sinais(noticias, serie, regime, caminho=None):
+    """Desenha o sinal de notícia no período inteiro, em dois painéis.
+
+    De cima para baixo: o que a notícia diz (manchete crua + estoque acumulado) e
+    o que o modelo consome (z do noticiário contra o limiar, e o voto que sai).
+    Sem `caminho`, abre a janela; com, grava o PNG (Colab, terminal sem GUI).
+    """
+    # Import local: o caminho do classificador roda em lote e não precisa de matplotlib.
+    import matplotlib.pyplot as plt
+
+    plt.style.use('seaborn-v0_8-darkgrid')
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+    # --- Painel 1: manchete crua + estoque acumulado ---
+    ax1.fill_between(serie.index, serie, 0, where=serie > 0, color=VERDE,
+                     alpha=0.55, interpolate=True, label='Estoque altista')
+    ax1.fill_between(serie.index, serie, 0, where=serie < 0, color=VERMELHO,
+                     alpha=0.55, interpolate=True, label='Estoque baixista')
+
+    _, pos = _dia_efetivo(noticias, serie.index)
+    dentro = pos < len(serie)
+    dia = serie.index[pos[dentro]]
+    sinal = noticias.loc[dentro, 'sinal']
+    ax1.scatter(dia, sinal, s=12, alpha=0.5, zorder=3,
+                color=np.where(sinal > 0, VERDE, VERMELHO),
+                label='Manchete individual')
+
+    ax1.axhline(0, color='black', linewidth=0.8)
+    # Mesma unidade nos dois: o estoque é a soma decaída dos pontos das manchetes.
+    ax1.set_ylabel('Sinal (pontos)', fontsize=11)
+    ax1.set_title(f'Sinal de Notícia — {len(sinal)} manchetes pontuadas entre '
+                  f'{serie.index[0].date()} e {serie.index[-1].date()}',
+                  fontsize=13, fontweight='bold')
+    ax1.legend(loc='upper left', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+
+    # --- Painel 2: o voto que entra no score de convicção ---
+    z = _zscore_noticia(serie)
+    ax2.plot(z.index, z, color=LARANJA, linewidth=1.0, label='z do noticiário')
+    ax2.axhline(LIMIAR_NOTICIA, color='gray', linewidth=0.7, linestyle=':')
+    ax2.axhline(-LIMIAR_NOTICIA, color='gray', linewidth=0.7, linestyle=':')
+    ax2.axhline(0, color='black', linewidth=0.8)
+
+    # Sombreia a faixa inteira onde o voto está ligado, para casar z com voto.
+    limites = ax2.get_ylim()
+    ax2.fill_between(regime.index, *limites, where=regime == 1, color=VERDE,
+                     alpha=0.2, label=f'Voto +1 ({(regime == 1).mean():.1%} dos dias)')
+    ax2.fill_between(regime.index, *limites, where=regime == -1, color=VERMELHO,
+                     alpha=0.2, label=f'Voto -1 ({(regime == -1).mean():.1%} dos dias)')
+    ax2.set_ylim(limites)
+
+    ax2.set_ylabel(f'z do noticiário ({JANELA_NORMALIZACAO} pregões)', fontsize=11)
+    ax2.set_title(f'Voto Discreto — dispara fora de ±{LIMIAR_NOTICIA:g} desvio; '
+                  f'zona morta em {(regime == 0).mean():.1%} dos dias',
+                  fontsize=13, fontweight='bold')
+    ax2.legend(loc='upper left', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if caminho:
+        fig.savefig(caminho, dpi=120)
+        print(f'\n🖼️ Gráfico salvo em {caminho}')
+    else:
+        plt.show()
+
+
+def _autoteste(caminho='noticias_pontuadas.csv', grafico=None):
     # Exercita o consumidor contra um calendário sintético de dias úteis.
     noticias = carregar_csv(caminho)
     inicio = noticias['datahora'].min().tz_localize(None).normalize()
@@ -782,19 +879,17 @@ def _autoteste(caminho='noticias_pontuadas.csv'):
     print(f'   Tilt bearish (-1): {(regime == -1).mean():.1%} dos dias')
     print(f'   Zona morta / sem notícia: {(regime == 0).mean():.1%} dos dias')
 
-    print('\n🔎 Mapeamento de cada notícia para o dia de pregão efetivo:')
-    local = noticias['datahora'].dt.tz_convert(FUSO_PREGAO).dt.tz_localize(None)
-    alvo = local.dt.normalize() + pd.to_timedelta((local.dt.hour >= HORA_CORTE).astype(int), unit='D')
-    pos = calendario.searchsorted(alvo)
-    for i in range(len(noticias)):
-        efetivo = calendario[pos[i]].date() if pos[i] < len(calendario) else 'fora do calendário'
-        print(f'   {local.iloc[i]:%Y-%m-%d %H:%M} ({local.iloc[i]:%a}) '
-              f'sinal={noticias["sinal"].iloc[i]:+.1f} -> {efetivo}')
+    # Contagem por ano: é aqui que buraco na base aparece como número, antes do gráfico.
+    print('\n📊 Manchetes pontuadas e dias de voto, por ano:')
+    ano_noticia = noticias['datahora'].dt.tz_convert(FUSO_PREGAO).dt.year
+    for ano in sorted(set(ano_noticia) | set(regime.index.year)):
+        sinais = noticias.loc[ano_noticia == ano, 'sinal']
+        votos = regime[regime.index.year == ano]
+        print(f'   {ano}: {(sinais < 0).sum():>4} manchetes negativas | '
+              f'{(sinais > 0).sum():>4} positivas | '
+              f'voto -1 em {(votos == -1).sum():>3}d | +1 em {(votos == 1).sum():>3}d')
 
-    janela = serie[serie != 0].head(20)
-    print('\n📉 Primeiros 20 dias com sinal acumulado (dá para ver o decaimento):')
-    for data, valor in janela.items():
-        print(f'   {data.date()}  {valor:+.3f}  {"#" * int(abs(valor) * 40)}')
+    plotar_sinais(noticias, serie, regime, grafico)
 
 
 if __name__ == '__main__':
@@ -804,13 +899,13 @@ if __name__ == '__main__':
         comparar_com_gabarito(sys.argv[2], sys.argv[3])
     elif len(sys.argv) in (3, 4) and sys.argv[1] == 'auditar':
         auditar_filtro(sys.argv[2], int(sys.argv[3]) if len(sys.argv) == 4 else 300)
-    elif len(sys.argv) == 2 and sys.argv[1].endswith('.csv'):
-        _autoteste(sys.argv[1])
+    elif len(sys.argv) in (2, 3) and sys.argv[1].endswith('.csv'):
+        _autoteste(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
     elif len(sys.argv) > 1:
         print('uso: python news_signal.py classificar <brutas.csv> <pontuadas.csv>')
         print('     python news_signal.py auditar <brutas.csv> [n]  (recall do filtro)')
         print('     python news_signal.py comparar <pontuadas.csv> <gabarito.csv>')
-        print('     python news_signal.py [pontuadas.csv]   (autoteste do consumidor)')
+        print('     python news_signal.py [pontuadas.csv] [grafico.png]  (autoteste do consumidor)')
         sys.exit(1)
     else:
         _autoteste()
